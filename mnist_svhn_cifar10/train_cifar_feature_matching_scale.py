@@ -13,6 +13,12 @@ import sys
 import plotting
 import cifar10_data
 
+
+## This code is a modification of Goodfellow code for GAN
+# The generator is asked to create a cifar image rescaled, the new image has size of 2 or 4 times bigger then the original one 
+# It is possible to change the value of the parameter "scale" to rescale the size of cifar up to 4
+
+
 # settings
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', default=1)
@@ -24,6 +30,33 @@ parser.add_argument('--learning_rate', type=float, default=0.0003)
 parser.add_argument('--data_dir', type=str, default='/home/guglielmo/dataset/cifar-10-python')
 args = parser.parse_args()
 print(args)
+
+
+from scipy import interpolate
+def rescale(img, scale=1):
+    scale_fact = scale
+    if scale>1:
+        x     = np.arange(img.shape[1])
+        y     = np.arange(img.shape[2])
+        x_new = np.linspace(0, img.shape[1]-1,  img.shape[1] * scale_fact)
+        y_new = np.linspace(0, img.shape[2]-1,  img.shape[2] * scale_fact)
+
+        img_out = np.zeros((img.shape[0], int(img.shape[1] * scale_fact), int(img.shape[2] * scale_fact)))
+        for cnt in range(3):
+            f     = interpolate.interp2d(x,y,img[cnt], kind='linear')
+            img_out[cnt] = f(x_new, y_new)
+    else:
+        img_out = img        
+    return np.asarray(img_out, dtype=np.float32)
+
+
+def tensorRescale(tensor, scale=1):
+    tensorScale = np.zeros((tensor.shape[0], 3, int(32*scale), int(32*scale)), dtype=np.float32)
+    for cnt in range(tensor.shape[0]):
+        tensorScale[cnt] = rescale(tensor[cnt], scale)
+    return tensorScale
+
+
 
 # fixed random seeds
 rng_data = np.random.RandomState(args.seed_data)
@@ -39,6 +72,9 @@ testx, testy = cifar10_data.load(args.data_dir, subset='test')
 nr_batches_train = int(trainx.shape[0]/args.batch_size)
 nr_batches_test = int(testx.shape[0]/args.batch_size)
 
+power = 1 # possible values: 0, 1, 2 
+scale = int(2**(power))
+
 # specify generative model
 noise_dim = (args.batch_size, 100)
 noise = theano_rng.uniform(size=noise_dim)
@@ -47,11 +83,22 @@ gen_layers.append(nn.batch_norm(ll.DenseLayer(gen_layers[-1], num_units=4*4*512,
 gen_layers.append(ll.ReshapeLayer(gen_layers[-1], (args.batch_size,512,4,4)))
 gen_layers.append(nn.batch_norm(nn.Deconv2DLayer(gen_layers[-1], (args.batch_size,256,8,8), (5,5), W=Normal(0.05), nonlinearity=nn.relu), g=None)) # 4 -> 8
 gen_layers.append(nn.batch_norm(nn.Deconv2DLayer(gen_layers[-1], (args.batch_size,128,16,16), (5,5), W=Normal(0.05), nonlinearity=nn.relu), g=None)) # 8 -> 16
-gen_layers.append(nn.weight_norm(nn.Deconv2DLayer(gen_layers[-1], (args.batch_size,3,32,32), (5,5), W=Normal(0.05), nonlinearity=T.tanh), train_g=True, init_stdv=0.1)) # 16 -> 32
+n_filter  = 128
+sz_filter = 16
+for cnt in range(0, power):
+   n_filter  /= 2
+   sz_filter *= 2
+   gen_layers.append(nn.batch_norm(nn.Deconv2DLayer(gen_layers[-1], (args.batch_size,n_filter,sz_filter,sz_filter), (5,5), W=Normal(0.05), nonlinearity=nn.relu), g=None)) # 16*(2**(cnt)) -> 32*(2**(cnt))
+    
+n_filter   = 3
+sz_filter *= 2    
+#print "sz_filter", sz_filter
+gen_layers.append(nn.weight_norm(nn.Deconv2DLayer(gen_layers[-1], (args.batch_size,n_filter,sz_filter,sz_filter), (5,5), W=Normal(0.05), nonlinearity=T.tanh), train_g=True, init_stdv=0.1))
 gen_dat = ll.get_output(gen_layers[-1])
 
+
 # specify discriminative model
-disc_layers = [ll.InputLayer(shape=(None, 3, 32, 32))]
+disc_layers = [ll.InputLayer(shape=(None, 3, 32*scale, 32*scale))]
 disc_layers.append(ll.DropoutLayer(disc_layers[-1], p=0.2))
 disc_layers.append(nn.weight_norm(dnn.Conv2DDNNLayer(disc_layers[-1], 96, (3,3), pad=1, W=Normal(0.05), nonlinearity=nn.lrelu)))
 disc_layers.append(nn.weight_norm(dnn.Conv2DDNNLayer(disc_layers[-1], 96, (3,3), pad=1, W=Normal(0.05), nonlinearity=nn.lrelu)))
@@ -144,8 +191,7 @@ for epoch in range(1200):
     trainx_unl2 = trainx_unl2[rng.permutation(trainx_unl2.shape[0])]
     
     if epoch==0:
-        print(trainx.shape)
-        init_param(trainx[:500]) # data based initialization
+        init_param(tensorRescale(trainx[:500], scale)) # data based initialization
 
     # train
     loss_lab = 0.
@@ -154,8 +200,14 @@ for epoch in range(1200):
     for t in range(nr_batches_train):
         ran_from = t*args.batch_size
         ran_to = (t+1)*args.batch_size
-        ll, lu, te = train_batch_disc(trainx[ran_from:ran_to],trainy[ran_from:ran_to],
-                                      trainx_unl[ran_from:ran_to],lr)
+
+        trainXscale    = tensorRescale(trainx[ran_from:ran_to], scale)
+        trainXunlScale = tensorRescale(trainx_unl[ran_from:ran_to], scale)
+
+        #ll, lu, te = train_batch_disc(trainx[ran_from:ran_to],trainy[ran_from:ran_to],
+        #trainx_unl[ran_from:ran_to],lr)
+
+        ll, lu, te = train_batch_disc(trainXscale, trainy[ran_from:ran_to], trainXunlScale, lr)
         loss_lab += ll
         loss_unl += lu
         train_err += te
@@ -169,7 +221,9 @@ for epoch in range(1200):
     # test
     test_err = 0.
     for t in range(nr_batches_test):
-        test_err += test_batch(testx[t*args.batch_size:(t+1)*args.batch_size],testy[t*args.batch_size:(t+1)*args.batch_size])
+        #test_err += test_batch(testx[t*args.batch_size:(t+1)*args.batch_size],testy[t*args.batch_size:(t+1)*args.batch_size])
+        testXscale = tensorRescale(testx[t*args.batch_size:(t+1)*args.batch_size], scale)
+        test_err  += test_batch(testXscale, testy[t*args.batch_size:(t+1)*args.batch_size])
     test_err /= nr_batches_test
 
     # report
